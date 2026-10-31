@@ -1,0 +1,83 @@
+// Endless Meadow: root placement and per-camera culling.
+#pragma kernel Generate
+#pragma kernel Cull
+
+uint SGHash(uint x) {x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;return x^(x>>16);}
+float SGRandom(uint x) {return (SGHash(x)&0xffffffu)/16777216.0;}
+
+// Roots: xyz world position, w = rotation in radians, or -1 for an empty slot (too steep).
+RWStructuredBuffer<float4> _Roots;
+Texture2D<float> _Heights;   // the terrain's own GPU heightmap (stays live while sculpting)
+SamplerState linear_clamp_sampler;
+float _HeightScale;          // heightmap value -> metres above the terrain origin
+// Painted terrain layers (up to 8): splat weights times the grass amount set per layer.
+Texture2D<float4> _Control0,_Control1;
+float2 _ControlSize;
+float4 _LayerGrass0,_LayerGrass1;
+float _UseLayers;
+uint _Total,_Columns,_Rows,_Seed;
+float3 _TerrainOrigin,_TerrainSize;
+float2 _HeightsSize;
+float _MaxSlope;            // tangent of the steepest slope that still gets grass
+
+float SampleHeight(float2 uv)
+{
+    float2 texel=(uv*(_HeightsSize-1)+.5)/_HeightsSize;
+    return _Heights.SampleLevel(linear_clamp_sampler,texel,0)*_HeightScale;
+}
+
+// One root per cell of a jittered grid. Ids are row-major, which lets Cull dispatch only the
+// rectangle of cells around a camera instead of every root.
+[numthreads(256,1,1)]
+void Generate(uint3 dispatch:SV_DispatchThreadID)
+{
+    uint id=dispatch.x;
+    if(id>=_Total) return;
+    float2 jitter=float2(SGRandom(id+_Seed),SGRandom(id+_Seed+7183))*.8+.1;
+    float2 uv=(float2(id%_Columns,id/_Columns)+jitter)/float2(_Columns,_Rows);
+    float h=SampleHeight(uv);
+    float2 step=1/max(_HeightsSize-1,1);
+    float2 metres=_TerrainSize.xz*step;
+    float slope=length(float2(SampleHeight(uv+float2(step.x,0))-SampleHeight(uv-float2(step.x,0)),
+                              SampleHeight(uv+float2(0,step.y))-SampleHeight(uv-float2(0,step.y)))/(2*metres));
+    float3 position=_TerrainOrigin+float3(uv.x*_TerrainSize.x,h,uv.y*_TerrainSize.z);
+    bool planted=slope<=_MaxSlope;
+    if(planted && _UseLayers>.5)
+    {
+        float2 controlUV=(uv*(_ControlSize-1)+.5)/_ControlSize;
+        float grass=dot(_Control0.SampleLevel(linear_clamp_sampler,controlUV,0),_LayerGrass0)
+                   +dot(_Control1.SampleLevel(linear_clamp_sampler,controlUV,0),_LayerGrass1);
+        planted=SGRandom(id+_Seed+5501)<grass;
+    }
+    _Roots[id]=float4(position,planted?SGRandom(id+_Seed+1907)*6.2831853:-1);
+}
+
+AppendStructuredBuffer<uint> _Visible0,_Visible1,_Visible2,_Visible3,_Visible4;
+uint4 _CellRect;            // first column, first row, width, height
+float4 _Planes[6];
+float3 _CameraPosition;
+float _CullDistance,_CullRadius;
+float4 _LodBands;           // start distance (m) of LOD bands 1..4
+
+[numthreads(256,1,1)]
+void Cull(uint3 dispatch:SV_DispatchThreadID)
+{
+    uint local=dispatch.x;
+    if(local>=_CellRect.z*_CellRect.w) return;
+    uint id=(_CellRect.y+local/_CellRect.z)*_Columns+_CellRect.x+local%_CellRect.z;
+    if(id>=_Total) return;
+    float4 root=_Roots[id];
+    if(root.w<0) return;
+    float2 delta=root.xz-_CameraPosition.xz;
+    float reach=_CullDistance+_CullRadius;
+    if(dot(delta,delta)>reach*reach) return;
+    float3 center=root.xyz+float3(0,_CullRadius*.5,0);
+    [unroll] for(int p=0;p<6;p++) if(dot(_Planes[p].xyz,center)+_Planes[p].w<-_CullRadius) return;
+    // Each distance band is drawn with a clump mesh holding only the blades it can still show.
+    float d=sqrt(dot(delta,delta));
+    if(d<_LodBands.x) _Visible0.Append(id);
+    else if(d<_LodBands.y) _Visible1.Append(id);
+    else if(d<_LodBands.z) _Visible2.Append(id);
+    else if(d<_LodBands.w) _Visible3.Append(id);
+    else _Visible4.Append(id);
+}
